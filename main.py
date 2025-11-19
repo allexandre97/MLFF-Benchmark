@@ -1,0 +1,381 @@
+#!/usr/bin/env python
+#%%
+import os
+import gc
+import argparse
+import multiprocessing as mp
+
+import numpy as np
+import mdtraj as md
+import qcportal
+import matplotlib.pyplot as plt
+
+from openmm import Platform, VerletIntegrator, LocalEnergyMinimizer
+from openmm.app import Simulation
+from openmm.unit import picosecond, kilojoules_per_mole, nanometer
+from openff.toolkit.topology import Molecule, Topology
+from openff.toolkit.typing.engines.smirnoff import ForceField
+
+from src.geometry import compute_internal_coordinates
+from src.stats    import freedman_diaconis_bins, histogram_cdf
+
+# -----------------------------------------------------------------------------
+# Global parallelism configuration / env vars
+# -----------------------------------------------------------------------------
+#%%
+# Number of logical CPU cores
+N_LOGICAL = 8#os.cpu_count() or 1
+
+# Threads per OpenMM simulation
+THREADS_PER_SIM = 4
+
+# Number of worker processes
+N_PROCS   = max(1, N_LOGICAL // THREADS_PER_SIM)
+BATCH_SIZE = int(N_PROCS * 2)
+
+# Make sure we don't grossly oversubscribe
+assert THREADS_PER_SIM * N_PROCS <= 4 * N_LOGICAL  # you can tighten if you want
+
+# OpenMM CPU threading
+os.environ.setdefault("OPENMM_CPU_THREADS", str(THREADS_PER_SIM))
+
+# Avoid BLAS / OpenMP contention
+os.environ.setdefault("OMP_NUM_THREADS", f"{THREADS_PER_SIM}")
+os.environ.setdefault("MKL_NUM_THREADS", f"{THREADS_PER_SIM}")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", f"{THREADS_PER_SIM}")
+
+# Disable GPUs by default (for espaloma / torch if used)
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+# -----------------------------------------------------------------------------
+# Globals shared across workers
+# -----------------------------------------------------------------------------
+
+QCARCHIVE_URL = "https://api.qcarchive.molssi.org:443"
+DATASET_NAME  = "OpenFF Industry Benchmark Season 1 v1.2"
+DATASET_TYPE  = "optimization"
+
+ang_to_nm = 0.1
+
+_client     = None
+_dataset    = None
+_BACKEND    = None  # "espaloma" or "openff"
+
+# Lazies per backend
+_esp_model  = None
+_ff         = ForceField("openff-2.2.1.offxml")
+
+# These imports are backend-dependent; we import lazily
+_espaloma_mod = None
+_torch_mod    = None
+_forcefield_class = None
+
+#%%
+# -----------------------------------------------------------------------------
+# Utility / stats helpers
+# -----------------------------------------------------------------------------
+
+def compute_rmsd(coords_A, coords_B):
+    traj0 = md.Trajectory(coords_A[None, :, :], None)
+    traj1 = md.Trajectory(coords_B[None, :, :], None)
+    return md.rmsd(traj1, traj0)[0]
+
+
+def rmsd_1d(x0, x1):
+    return np.sqrt(np.mean((x1 - x0) ** 2))
+
+
+def rmsd_periodic(phi0, phi1):
+    d = phi1 - phi0
+    d = (d + np.pi) % (2 * np.pi) - np.pi  # wrap to (-π, π]
+    return np.sqrt(np.mean(d ** 2))
+
+
+# -----------------------------------------------------------------------------
+# Lazy singletons: QCArchive client + dataset
+# -----------------------------------------------------------------------------
+
+def get_client():
+    global _client
+    if _client is None:
+        _client = qcportal.PortalClient(QCARCHIVE_URL)
+    return _client
+
+
+def get_dataset():
+    global _dataset
+    if _dataset is None:
+        client = get_client()
+        _dataset = client.get_dataset(
+            dataset_name=DATASET_NAME,
+            dataset_type=DATASET_TYPE,
+        )
+    return _dataset
+
+
+# -----------------------------------------------------------------------------
+# Backend-specific model accessors
+# -----------------------------------------------------------------------------
+
+def get_espaloma_model():
+    global _esp_model, _espaloma_mod, _torch_mod
+    if _esp_model is None:
+        # Lazy imports so openff-only runs don't require these installed
+        import espaloma as esp
+        import torch
+
+        _espaloma_mod = esp
+        _torch_mod    = torch
+
+        model = esp.get_model("latest")
+        model.to("cpu")
+        _esp_model = model
+    return _esp_model, _espaloma_mod, _torch_mod
+
+
+def get_forcefield():
+    ff = ForceField("openff-2.2.1.offxml")
+    return ff
+
+
+# -----------------------------------------------------------------------------
+# OpenMM simulation helper
+# -----------------------------------------------------------------------------
+
+def make_simulation(topology, system):
+    integrator = VerletIntegrator(0.002 * picosecond)
+    platform   = Platform.getPlatformByName("CPU")
+    properties = {"Threads": str(THREADS_PER_SIM)}
+    sim = Simulation(topology, system, integrator, platform, properties)
+    return sim
+
+
+# -----------------------------------------------------------------------------
+# Backend-specific system builders
+# -----------------------------------------------------------------------------
+
+def build_system_espaloma(mol, top):
+    model, esp, torch = get_espaloma_model()
+
+    mgraph = esp.Graph(mol)
+    mgraph.heterograph = mgraph.heterograph.to("cpu")
+
+    with torch.no_grad():
+        model(mgraph.heterograph)
+
+    system = esp.graphs.deploy.openmm_system_from_graph(mgraph)
+    return system, mgraph  # mgraph can be deleted after use
+
+
+def build_system_openff(mol, top):
+    ff = get_forcefield()
+    system = ff.create_openmm_system(top)
+    return system, None
+
+
+# -----------------------------------------------------------------------------
+# Single-molecule computation
+# -----------------------------------------------------------------------------
+
+def process_single_molecule(name: str):
+    dataset = get_dataset()
+    backend = _BACKEND
+
+    entry  = dataset.get_entry(entry_name=name)
+    coords = np.asarray(entry.dict()["initial_molecule"]["geometry"], dtype=float) * ang_to_nm
+    mol    = Molecule.from_qcschema(entry)
+    top    = Topology.from_molecules(molecules=[mol])
+
+    if backend == "espaloma":
+        system, mgraph = build_system_espaloma(mol, top)
+    elif backend == "openff":
+        system = _ff.create_openmm_system(top)
+        mgraph = None
+    else:
+        raise ValueError(f"Unknown backend {_BACKEND!r}")
+
+    simulation = make_simulation(top, system)
+    simulation.context.setPositions(coords)
+
+    # Initial state
+    state  = simulation.context.getState(getEnergy=True, getForces=True, getPositions=True)
+    energy = state.getPotentialEnergy()
+    forces = state.getForces(asNumpy=True)
+    forces = forces.value_in_unit(kilojoules_per_mole / nanometer).astype(np.float32)
+    coords0 = state.getPositions(asNumpy=True)
+    coords0 = coords0.value_in_unit(nanometer).astype(np.float32)
+    ic0     = compute_internal_coordinates(mol, coords0)
+
+    # Minimize
+    LocalEnergyMinimizer.minimize(
+        simulation.context,
+        tolerance=10 * kilojoules_per_mole / nanometer,
+        maxIterations=10_000,
+    )
+
+    # Minimized state
+    state_minim = simulation.context.getState(getEnergy=True, getForces=True, getPositions=True)
+    energy_min  = state_minim.getPotentialEnergy()
+    forces_min  = state_minim.getForces(asNumpy=True)
+    forces_min  = forces_min.value_in_unit(kilojoules_per_mole / nanometer).astype(np.float32)
+    coords1     = state_minim.getPositions(asNumpy=True)
+    coords1     = coords1.value_in_unit(nanometer).astype(np.float32)
+    ic1         = compute_internal_coordinates(mol, coords1)
+
+    # RMSDs
+    rmsd_cart      = compute_rmsd(coords1, coords0)
+    rmsd_bonds     = rmsd_1d(ic1["bonds"],     ic0["bonds"])
+    rmsd_angles    = rmsd_periodic(ic1["angles"],    ic0["angles"])
+    rmsd_propers   = rmsd_periodic(ic1["propers"],   ic0["propers"])
+    rmsd_impropers = rmsd_periodic(ic1["impropers"], ic0["impropers"])
+
+    # Clean up
+    del state, state_minim, forces, forces_min, coords0, coords1, ic0, ic1
+    del system, simulation
+    if mgraph is not None:
+        del mgraph
+    gc.collect()
+
+    return {
+        "name": name,
+        "rmsd_cart": rmsd_cart,
+        "rmsd_bonds": rmsd_bonds,
+        "rmsd_angles": rmsd_angles,
+        "rmsd_propers": rmsd_propers,
+        "rmsd_impropers": rmsd_impropers,
+        "energy_initial": energy,
+        "energy_min": energy_min,
+    }
+
+
+# -----------------------------------------------------------------------------
+# Batch worker + helpers
+# -----------------------------------------------------------------------------
+
+def process_batch(name_batch):
+    out = []
+    for name in name_batch:
+        try:
+            res = process_single_molecule(name)
+            out.append(res)
+        except Exception as e:
+            print(e)
+            out.append({"name": name, "error": repr(e)})
+    return out
+
+
+def chunk_list(seq, size):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+#%%
+# -----------------------------------------------------------------------------
+# Main driver
+# -----------------------------------------------------------------------------
+
+def main(backend: str, max_mols: int | None = None):
+    global _BACKEND
+    _BACKEND = backend
+
+    os.environ["OPENMM_CPU_THREADS"] = str(THREADS_PER_SIM)
+
+    print(f"Backend: {backend}")
+    print(f"Logical cores: {N_LOGICAL}")
+    print(f"Using {N_PROCS} processes × {THREADS_PER_SIM} OpenMM threads "
+          f"= {N_PROCS * THREADS_PER_SIM} OpenMM threads total")
+
+    client  = qcportal.PortalClient(QCARCHIVE_URL)
+    dataset = client.get_dataset(dataset_name=DATASET_NAME, dataset_type=DATASET_TYPE)
+    names   = list(dataset.entry_names)
+    if max_mols is not None:
+        names = names[:max_mols]
+
+    batches = list(chunk_list(names, BATCH_SIZE))
+
+    all_results = []
+    with mp.Pool(processes=N_PROCS, maxtasksperchild=10) as pool:
+        for i, batch_res in enumerate(pool.map(process_batch, batches), start=1):
+            print(f"Completed batch {i}/{len(batches)}")
+            all_results.extend(batch_res)
+
+    filtered = [r for r in all_results if "error" not in r]
+
+    rmsd_array = np.array([
+        [
+            r["rmsd_cart"],
+            r["rmsd_bonds"],
+            r["rmsd_angles"],
+            r["rmsd_propers"],
+            r["rmsd_impropers"],
+        ]
+        for r in filtered
+    ])
+
+    return rmsd_array
+
+
+# -----------------------------------------------------------------------------
+# Plotting
+# -----------------------------------------------------------------------------
+
+def graph_rmsd(rmsd,
+               title    = "Structure",
+               xlabel   = "RMSD / nm",
+               ylabel   = "P(RMSD)",
+               ylabel_2 = "CDF(RMSD)"):
+
+    fig, ax = plt.subplots(figsize=(7, 7), layout="tight")
+    ax_2 = ax.twinx()
+
+    ax.set_title(title, fontsize=20, fontweight="bold")
+
+    n, b, _ = ax.hist(
+        rmsd,
+        bins=freedman_diaconis_bins(rmsd),
+        density=True,
+        color="royalblue",
+        edgecolor="k",
+    )
+
+    cdf = histogram_cdf(n, b)
+    ax_2.plot(b, cdf, c="k")
+    ax_2.set_ylim(0)
+
+    ax.set_xlabel(xlabel, fontsize=18, fontweight="bold")
+    ax.set_ylabel(ylabel, fontsize=18, fontweight="bold")
+    ax_2.set_ylabel(ylabel_2, fontsize=18, fontweight="bold")
+    ax.tick_params(labelsize=16)
+    ax_2.tick_params(labelsize=16)
+
+
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--backend",
+        choices=["espaloma", "openff"],
+        default="espaloma",
+        help="Which model to use for building the OpenMM system.",
+    )
+    parser.add_argument(
+        "--max-mols",
+        type=int,
+        default=1,
+        help="Optional cap on number of molecules to process.",
+    )
+    args = parser.parse_args()
+
+    rmsd_array = main(backend=args.backend, max_mols=args.max_mols)
+
+    # Example plotting
+    graph_rmsd(rmsd_array[:, 0], title="Structure", xlabel="RMSD / nm")
+    graph_rmsd(rmsd_array[:, 1], title="Bonds",     xlabel="RMSD / nm")
+    graph_rmsd(rmsd_array[:, 2], title="Angles",    xlabel="RMSD / rad")
+    graph_rmsd(rmsd_array[:, 3], title="Propers",   xlabel="RMSD / rad")
+    graph_rmsd(rmsd_array[:, 4], title="Impropers", xlabel="RMSD / rad")
+
+    plt.show()
+# %%
