@@ -18,6 +18,7 @@ from openff.toolkit.typing.engines.smirnoff import ForceField
 
 from src.geometry import compute_internal_coordinates, compute_tfd_from_coords
 from src.stats    import freedman_diaconis_bins, histogram_cdf
+from src.io       import BenchmarkResults
 
 # -----------------------------------------------------------------------------
 # Global parallelism configuration / env vars
@@ -184,6 +185,7 @@ def process_single_molecule(name: str):
     coords = np.asarray(entry.dict()["initial_molecule"]["geometry"], dtype=float) * ang_to_nm
     mol    = Molecule.from_qcschema(entry)
     top    = Topology.from_molecules(molecules=[mol])
+    smiles = mol.to_smiles()
 
     if backend == "espaloma":
         system, mgraph = build_system_espaloma(mol, top)
@@ -198,7 +200,7 @@ def process_single_molecule(name: str):
 
     # Initial state
     state  = simulation.context.getState(getEnergy=True, getForces=True, getPositions=True)
-    energy = state.getPotentialEnergy()
+    energy = state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
     forces = state.getForces(asNumpy=True)
     forces = forces.value_in_unit(kilojoules_per_mole / nanometer).astype(np.float32)
     coords0 = state.getPositions(asNumpy=True)
@@ -214,7 +216,7 @@ def process_single_molecule(name: str):
 
     # Minimized state
     state_minim = simulation.context.getState(getEnergy=True, getForces=True, getPositions=True)
-    energy_min  = state_minim.getPotentialEnergy()
+    energy_min  = state_minim.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
     forces_min  = state_minim.getForces(asNumpy=True)
     forces_min  = forces_min.value_in_unit(kilojoules_per_mole / nanometer).astype(np.float32)
     coords1     = state_minim.getPositions(asNumpy=True)
@@ -230,7 +232,7 @@ def process_single_molecule(name: str):
     tfd            = compute_tfd_from_coords(mol, coords0, coords1)
 
     # Clean up
-    del state, state_minim, forces, forces_min, coords0, coords1, ic0, ic1
+    del state, state_minim, forces, forces_min, ic0, ic1
     del system, simulation
     if mgraph is not None:
         del mgraph
@@ -238,6 +240,7 @@ def process_single_molecule(name: str):
 
     return {
         "name": name,
+        "smiles":smiles,
         "coords":{"qm":coords0,
                   "min":coords1},
         "rmsd_cart": rmsd_cart,
@@ -314,7 +317,11 @@ def main(backend: str, max_mols: int | None = None):
         for r in filtered
     ])
 
-    return rmsd_array
+    bench = BenchmarkResults(backend=backend, dataset_name=DATASET_NAME)
+    for r in filtered:
+        bench.add(r)
+
+    return rmsd_array, bench
 
 
 # -----------------------------------------------------------------------------
@@ -369,9 +376,19 @@ if __name__ == "__main__":
         default=1,
         help="Optional cap on number of molecules to process.",
     )
+    parser.add_argument(
+        "--out",
+        type=str,
+        default=None,
+        help="Optional HDF5 file to save benchmark results.",
+    )
     args = parser.parse_args()
 
-    rmsd_array = main(backend=args.backend, max_mols=args.max_mols)
+    rmsd_array, bench = main(backend=args.backend, max_mols=args.max_mols)
+
+    if args.out is not None:
+        bench.to_hdf5(args.out)
+        print(f"Saved benchmark results to {args.out}")
 
     # Example plotting
     graph_rmsd(rmsd_array[:, 0], title="Structure", xlabel="RMSD / nm")
@@ -382,4 +399,3 @@ if __name__ == "__main__":
     graph_rmsd(rmsd_array[:, 5], title="TFD",       xlabel="TFD", ylabel="P(TFD)", ylabel_2="CDF(TFD)")
 
     plt.show()
-# %%
