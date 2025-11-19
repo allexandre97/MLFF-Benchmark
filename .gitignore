@@ -1,4 +1,5 @@
 Models/
-Dasasets/
+Datasets/
+.vscode/
 src/__pycache__
 install_env.sh

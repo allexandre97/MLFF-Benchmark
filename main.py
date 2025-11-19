@@ -16,7 +16,7 @@ from openmm.unit import picosecond, kilojoules_per_mole, nanometer
 from openff.toolkit.topology import Molecule, Topology
 from openff.toolkit.typing.engines.smirnoff import ForceField
 
-from src.geometry import compute_internal_coordinates
+from src.geometry import compute_internal_coordinates, compute_tfd_from_coords
 from src.stats    import freedman_diaconis_bins, histogram_cdf
 
 # -----------------------------------------------------------------------------
@@ -24,7 +24,7 @@ from src.stats    import freedman_diaconis_bins, histogram_cdf
 # -----------------------------------------------------------------------------
 #%%
 # Number of logical CPU cores
-N_LOGICAL = 8#os.cpu_count() or 1
+N_LOGICAL = 16#os.cpu_count() or 1
 
 # Threads per OpenMM simulation
 THREADS_PER_SIM = 4
@@ -166,7 +166,6 @@ def build_system_espaloma(mol, top):
     system = esp.graphs.deploy.openmm_system_from_graph(mgraph)
     return system, mgraph  # mgraph can be deleted after use
 
-
 def build_system_openff(mol, top):
     ff = get_forcefield()
     system = ff.create_openmm_system(top)
@@ -228,6 +227,7 @@ def process_single_molecule(name: str):
     rmsd_angles    = rmsd_periodic(ic1["angles"],    ic0["angles"])
     rmsd_propers   = rmsd_periodic(ic1["propers"],   ic0["propers"])
     rmsd_impropers = rmsd_periodic(ic1["impropers"], ic0["impropers"])
+    tfd            = compute_tfd_from_coords(mol, coords0, coords1)
 
     # Clean up
     del state, state_minim, forces, forces_min, coords0, coords1, ic0, ic1
@@ -238,6 +238,8 @@ def process_single_molecule(name: str):
 
     return {
         "name": name,
+        "coords":{"qm":coords0,
+                  "min":coords1},
         "rmsd_cart": rmsd_cart,
         "rmsd_bonds": rmsd_bonds,
         "rmsd_angles": rmsd_angles,
@@ -245,6 +247,7 @@ def process_single_molecule(name: str):
         "rmsd_impropers": rmsd_impropers,
         "energy_initial": energy,
         "energy_min": energy_min,
+        "tfd":tfd,
     }
 
 
@@ -294,8 +297,7 @@ def main(backend: str, max_mols: int | None = None):
 
     all_results = []
     with mp.Pool(processes=N_PROCS, maxtasksperchild=10) as pool:
-        for i, batch_res in enumerate(pool.map(process_batch, batches), start=1):
-            print(f"Completed batch {i}/{len(batches)}")
+        for batch_res in pool.map(process_batch, batches):
             all_results.extend(batch_res)
 
     filtered = [r for r in all_results if "error" not in r]
@@ -307,6 +309,7 @@ def main(backend: str, max_mols: int | None = None):
             r["rmsd_angles"],
             r["rmsd_propers"],
             r["rmsd_impropers"],
+            r["tfd"],
         ]
         for r in filtered
     ])
@@ -376,6 +379,7 @@ if __name__ == "__main__":
     graph_rmsd(rmsd_array[:, 2], title="Angles",    xlabel="RMSD / rad")
     graph_rmsd(rmsd_array[:, 3], title="Propers",   xlabel="RMSD / rad")
     graph_rmsd(rmsd_array[:, 4], title="Impropers", xlabel="RMSD / rad")
+    graph_rmsd(rmsd_array[:, 5], title="TFD",       xlabel="TFD", ylabel="P(TFD)", ylabel_2="CDF(TFD)")
 
     plt.show()
 # %%

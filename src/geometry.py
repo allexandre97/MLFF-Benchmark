@@ -1,6 +1,9 @@
 from openff.toolkit.topology import Molecule
 import numpy as np
 
+from rdkit import Chem
+from rdkit.Chem import TorsionFingerprints
+
 def extract_internal_indices(off_mol: Molecule):
     # Bond indices
     bond_idx = np.array(
@@ -115,3 +118,53 @@ def compute_internal_coordinates(off_mol, coords):
         "impropers": improps,  # radians
         "indices": idx,
     }
+
+def compute_tfd_from_coords(off_mol: Molecule,
+                            coords0_nm: np.ndarray,
+                            coords1_nm: np.ndarray) -> float:
+    """
+    Compute torsion fingerprint deviation (TFD) between two conformers
+    of the same molecule using RDKit's implementation.
+
+    Parameters
+    ----------
+    off_mol : openff.toolkit.topology.Molecule
+        Molecule whose conformers are being compared.
+    coords0_nm, coords1_nm : (N, 3) float arrays
+        Cartesian coordinates in nanometers, same atom ordering.
+
+    Returns
+    -------
+    float
+        TFD value (0 = identical, ~1 = very different).
+    """
+    # Convert coords to Å for RDKit
+    coords0_A = coords0_nm * 10.0
+    coords1_A = coords1_nm * 10.0
+
+    n_atoms = coords0_A.shape[0]
+
+    # Convert OpenFF Molecule to RDKit Mol and strip any existing conformers
+    rdmol = off_mol.to_rdkit()
+    rdmol.RemoveAllConformers()
+
+    # Build first conformer
+    conf0 = Chem.Conformer(n_atoms)
+    for i in range(n_atoms):
+        x, y, z = coords0_A[i]
+        conf0.SetAtomPosition(i, (float(x), float(y), float(z)))
+    rdmol.AddConformer(conf0, assignId=True)  # id = 0
+
+    # Build second conformer
+    conf1 = Chem.Conformer(n_atoms)
+    for i in range(n_atoms):
+        x, y, z = coords1_A[i]
+        conf1.SetAtomPosition(i, (float(x), float(y), float(z)))
+    rdmol.AddConformer(conf1, assignId=True)  # id = 1
+
+    # RDKit TFD between conformers 0 and 1
+    tfd_list = TorsionFingerprints.GetTFDBetweenConformers(
+        rdmol, confIds1=[0], confIds2=[1]
+    )
+    # GetTFDBetweenConformers returns a list; here it's length 1
+    return float(tfd_list[0])
