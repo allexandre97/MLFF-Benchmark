@@ -29,6 +29,7 @@ class BenchmarkResults:
         self.rmsd_impropers = []
         self.tfd            = []
 
+        self.energy_qm      = []
         self.energy_initial = []
         self.energy_min     = []
 
@@ -59,6 +60,7 @@ class BenchmarkResults:
         self.rmsd_impropers.append(float(record["rmsd_impropers"]))
         self.tfd.append(float(record["tfd"]))
 
+        self.energy_qm.append(float(record["energy_qm"]))
         self.energy_initial.append(float(record["energy_initial"]))
         self.energy_min.append(float(record["energy_min"]))
 
@@ -96,6 +98,7 @@ class BenchmarkResults:
         rmsd_impropers = np.asarray(self.rmsd_impropers, dtype=np.float32)
         tfd            = np.asarray(self.tfd,            dtype=np.float32)
 
+        energy_qm      = np.asarray(self.energy_qm,      dtype=np.float32)
         energy_initial = np.asarray(self.energy_initial, dtype=np.float32)
         energy_min     = np.asarray(self.energy_min,     dtype=np.float32)
 
@@ -122,6 +125,7 @@ class BenchmarkResults:
             f.create_dataset("rmsd_impropers", data=rmsd_impropers)
             f.create_dataset("tfd",            data=tfd)
 
+            f.create_dataset("energy_qm",      data=energy_qm)
             f.create_dataset("energy_initial", data=energy_initial)
             f.create_dataset("energy_min",     data=energy_min)
 
@@ -152,6 +156,7 @@ class BenchmarkResults:
             obj.rmsd_impropers = f["rmsd_impropers"][()].tolist()
             obj.tfd            = f["tfd"][()].tolist()
 
+            obj.energy_qm      = f["energy_qm"][()].tolist()
             obj.energy_initial = f["energy_initial"][()].tolist()
             obj.energy_min     = f["energy_min"][()].tolist()
 

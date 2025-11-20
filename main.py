@@ -8,6 +8,7 @@ import multiprocessing as mp
 import numpy as np
 import mdtraj as md
 import qcportal
+import qcengine
 import matplotlib.pyplot as plt
 
 from openmm import Platform, VerletIntegrator, LocalEnergyMinimizer
@@ -15,6 +16,7 @@ from openmm.app import Simulation
 from openmm.unit import picosecond, kilojoules_per_mole, nanometer
 from openff.toolkit.topology import Molecule, Topology
 from openff.toolkit.typing.engines.smirnoff import ForceField
+from openff.qcsubmit.results import OptimizationResultCollection
 
 from src.geometry import compute_internal_coordinates, compute_tfd_from_coords
 from src.stats    import freedman_diaconis_bins, histogram_cdf
@@ -52,13 +54,13 @@ os.environ["CUDA_VISIBLE_DEVICES"] = ""
 # Globals shared across workers
 # -----------------------------------------------------------------------------
 
-QCARCHIVE_URL = "https://api.qcarchive.molssi.org:443"
+QCARCHIVE_URL = "https://api.qcarchive.molssi.org:443/"
 DATASET_NAME  = "OpenFF Industry Benchmark Season 1 v1.2"
 DATASET_TYPE  = "optimization"
 
 ang_to_nm = 0.1
 
-_client     = None
+_client     = qcportal.PortalClient(QCARCHIVE_URL)
 _dataset    = None
 _BACKEND    = None  # "espaloma" or "openff"
 
@@ -106,11 +108,7 @@ def get_client():
 def get_dataset():
     global _dataset
     if _dataset is None:
-        client = get_client()
-        _dataset = client.get_dataset(
-            dataset_name=DATASET_NAME,
-            dataset_type=DATASET_TYPE,
-        )
+        _dataset = OptimizationResultCollection.parse_file("Datasets/Industry/OpenFF_1.2.json")
     return _dataset
 
 
@@ -177,15 +175,18 @@ def build_system_openff(mol, top):
 # Single-molecule computation
 # -----------------------------------------------------------------------------
 
-def process_single_molecule(name: str):
-    dataset = get_dataset()
+def process_single_molecule(rec_id: int):
     backend = _BACKEND
 
-    entry  = dataset.get_entry(entry_name=name)
-    coords = np.asarray(entry.dict()["initial_molecule"]["geometry"], dtype=float) * ang_to_nm
-    mol    = Molecule.from_qcschema(entry)
+    entry          = _client.get_optimizations(rec_id, include="final_molecule")
+    final_molecule = entry.final_molecule
+
+    name   = final_molecule.dict()["name"]
+    coords = np.asarray(final_molecule.dict()["geometry"], dtype=float) * ang_to_nm
+    mol    = Molecule.from_qcschema(final_molecule)
     top    = Topology.from_molecules(molecules=[mol])
     smiles = mol.to_smiles()
+    qm_energy = entry.dict()["energies"][-1] * 2625.5 # To kJ/mol
 
     if backend == "espaloma":
         system, mgraph = build_system_espaloma(mol, top)
@@ -210,7 +211,7 @@ def process_single_molecule(name: str):
     # Minimize
     LocalEnergyMinimizer.minimize(
         simulation.context,
-        tolerance=10 * kilojoules_per_mole / nanometer,
+        tolerance=100 * kilojoules_per_mole / nanometer,
         maxIterations=10_000,
     )
 
@@ -248,6 +249,7 @@ def process_single_molecule(name: str):
         "rmsd_angles": rmsd_angles,
         "rmsd_propers": rmsd_propers,
         "rmsd_impropers": rmsd_impropers,
+        "energy_qm": qm_energy,
         "energy_initial": energy,
         "energy_min": energy_min,
         "tfd":tfd,
@@ -258,15 +260,15 @@ def process_single_molecule(name: str):
 # Batch worker + helpers
 # -----------------------------------------------------------------------------
 
-def process_batch(name_batch):
+def process_batch(ids_batch):
     out = []
-    for name in name_batch:
+    for rec_id in ids_batch:
         try:
-            res = process_single_molecule(name)
+            res = process_single_molecule(rec_id)
             out.append(res)
         except Exception as e:
             print(e)
-            out.append({"name": name, "error": repr(e)})
+            out.append({"name": rec_id, "error": repr(e)})
     return out
 
 
@@ -291,12 +293,14 @@ def main(backend: str, max_mols: int | None = None):
           f"= {N_PROCS * THREADS_PER_SIM} OpenMM threads total")
 
     client  = qcportal.PortalClient(QCARCHIVE_URL)
-    dataset = client.get_dataset(dataset_name=DATASET_NAME, dataset_type=DATASET_TYPE)
-    names   = list(dataset.entry_names)
-    if max_mols is not None:
-        names = names[:max_mols]
+    dataset = OptimizationResultCollection.parse_file("Datasets/Industry/OpenFF_1.2.json")
+    results = dataset.entries[QCARCHIVE_URL]
+    rec_ids = [result.record_id for result in results]
 
-    batches = list(chunk_list(names, BATCH_SIZE))
+    if max_mols is not None:
+        rec_ids = rec_ids[:max_mols]
+
+    batches = list(chunk_list(rec_ids, BATCH_SIZE))
 
     all_results = []
     with mp.Pool(processes=N_PROCS, maxtasksperchild=10) as pool:
